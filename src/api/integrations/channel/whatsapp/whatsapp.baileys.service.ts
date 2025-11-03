@@ -678,6 +678,23 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    // Clean up old client before creating new one
+    if (this.client) {
+      try {
+        this.client.ws?.close();
+        this.client.end(new Error('Reconnecting - cleaning old client'));
+        // Destroy and recreate message processor to reset RxJS streams
+        this.messageProcessor.onDestroy();
+        this.messageProcessor = new BaileysMessageProcessor();
+        this.messageProcessor.mount({
+          onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+        });
+      } catch (error) {
+        this.logger.warn('Error cleaning up old client:');
+        this.logger.warn(error);
+      }
+    }
+
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
@@ -1130,15 +1147,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const messageKey = `${this.instance.id}_${received.key.id}`;
-          const cached = await this.baileysCache.get(messageKey);
-
-          if (cached && !editedMessage && !requestId) {
-            this.logger.info(`Message duplicated ignored: ${received.key.id}`);
-            continue;
-          }
-
-          await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+          // Removed duplicate message check - allowing all messages to be processed
 
           if (
             (type !== 'notify' && type !== 'append') ||
@@ -1238,29 +1247,20 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
-            const fromMe = received.key.fromMe.toString();
-            const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
 
-            const cachedTimestamp = await this.baileysCache.get(messageKey);
-
-            if (!cachedTimestamp) {
-              if (!received.key.fromMe) {
-                if (msg.status === status[3]) {
-                  this.logger.log(`Update not read messages ${remoteJid}`);
-                  await this.updateChatUnreadMessages(remoteJid);
-                } else if (msg.status === status[4]) {
-                  this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
-                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                }
-              } else {
-                // is send message by me
+            // Removed duplicate read message check - allowing all read messages to be processed
+            if (!received.key.fromMe) {
+              if (msg.status === status[3]) {
+                this.logger.log(`Update not read messages ${remoteJid}`);
+                await this.updateChatUnreadMessages(remoteJid);
+              } else if (msg.status === status[4]) {
                 this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
                 await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
               }
-
-              await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
             } else {
-              this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
+              // is send message by me
+              this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
+              await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
             }
 
             if (isMedia) {
@@ -1437,16 +1437,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (update.message !== null && update.status === undefined) continue;
 
-        const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
-
-        const cached = await this.baileysCache.get(updateKey);
-
-        if (cached) {
-          this.logger.info(`Message duplicated ignored [avoid deadlock]: ${updateKey}`);
-          continue;
-        }
-
-        await this.baileysCache.set(updateKey, true, 30 * 60);
+        // Removed duplicate update check - allowing all updates to be processed
 
         if (status[update.status] === 'READ' && key.fromMe) {
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -1504,8 +1495,16 @@ export class BaileysStartupService extends ChannelStartupService {
           if (update.message === null && update.status === undefined) {
             this.sendDataWebhook(Events.MESSAGES_DELETE, key);
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-              await this.prismaRepository.messageUpdate.create({ data: message });
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+              if (message.messageId) {
+                await this.prismaRepository.messageUpdate.create({
+                  data: {
+                    ...message,
+                    Message: { connect: { id: message.messageId } },
+                  },
+                });
+              }
+            }
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               this.chatwootService.eventWhatsapp(
@@ -1524,34 +1523,32 @@ export class BaileysStartupService extends ChannelStartupService {
 
               const { remoteJid } = key;
               const timestamp = findMessage.messageTimestamp;
-              const fromMe = key.fromMe.toString();
-              const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
 
-              const cachedTimestamp = await this.baileysCache.get(messageKey);
-
-              if (!cachedTimestamp) {
-                if (status[update.status] === status[4]) {
-                  this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
-                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                  await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
-                }
-
-                await this.prismaRepository.message.update({
-                  where: { id: findMessage.id },
-                  data: { status: status[update.status] },
-                });
-              } else {
-                this.logger.info(
-                  `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
-                );
+              // Removed duplicate message update check - allowing all message updates to be processed
+              if (status[update.status] === status[4]) {
+                this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
+                await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
               }
+
+              await this.prismaRepository.message.update({
+                where: { id: findMessage.id },
+                data: { status: status[update.status] },
+              });
             }
           }
 
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-            await this.prismaRepository.messageUpdate.create({ data: message });
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+            if (message.messageId) {
+              await this.prismaRepository.messageUpdate.create({
+                data: {
+                  ...message,
+                  Message: { connect: { id: message.messageId } },
+                },
+              });
+            }
+          }
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
@@ -1753,7 +1750,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (events['messaging-history.set']) {
           const payload = events['messaging-history.set'];
-          this.messageHandle['messaging-history.set'](payload);
+          // Process async to not block realtime events
+          this.messageHandle['messaging-history.set'](payload).catch((error) => {
+            this.logger.error('Error processing messaging-history.set:');
+            this.logger.error(error);
+          });
         }
 
         if (events['messages.upsert']) {
